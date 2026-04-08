@@ -526,6 +526,12 @@ def text_to_image(text: str, font_size: int = 24) -> list:
     return (~(arr > 127)).tolist()
 
 
+def make_solid_black_rows(mm: float) -> list:
+    # 200 DPI -> ~8 dots per mm
+    n_rows = int(mm * 8)
+    return [[1] * PRINT_WIDTH for _ in range(n_rows)]
+
+
 async def _scan_for_printer(name: Optional[str], timeout: int):
     from bleak import BleakScanner
     from bleak.backends.scanner import AdvertisementData
@@ -641,6 +647,7 @@ def _build_parser() -> argparse.ArgumentParser:
             "Examples:\n"
             "  uv run print.py photo.jpg\n"
             '  uv run print.py "Hello!" --text\n'
+            "  uv run print.py --black 20\n"
             "  uv run print.py note.png --device GT01 --energy 0x8000\n"
             "  uv run print.py --scan"
         ),
@@ -656,6 +663,13 @@ def _build_parser() -> argparse.ArgumentParser:
         "-t",
         action="store_true",
         help="Treat 'content' as a text string to render and print.",
+    )
+    p.add_argument(
+        "--black",
+        type=float,
+        default=None,
+        metavar="MM",
+        help="Print a solid black block with height MM millimeters.",
     )
     p.add_argument(
         "--device",
@@ -709,7 +723,11 @@ def main():
         asyncio.run(scan_and_list())
         return
 
-    if args.content is None:
+    if args.black is not None and args.black <= 0:
+        log.error("🛑 --black must be greater than 0.")
+        sys.exit(1)
+
+    if args.black is None and args.content is None:
         parser.print_help()
         sys.exit(1)
 
@@ -721,7 +739,11 @@ def main():
         log.error(f"🛑 Invalid --energy value: {args.energy!r}. Use hex like 0xffff.")
         sys.exit(1)
 
-    if args.text:
+    if args.black is not None:
+        log.info(f"⏳ Building solid black block: {args.black} mm")
+        rows = make_solid_black_rows(args.black)
+        log.info(f"✅ Built: {len(rows)} rows × {PRINT_WIDTH} px")
+    elif args.text:
         log.info(f"⏳ Rendering text: {args.content!r}")
         rows = text_to_image(args.content, font_size=args.font_size)
         log.info(f"✅ Rendered: {len(rows)} rows × {PRINT_WIDTH} px")
