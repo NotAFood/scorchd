@@ -49,7 +49,7 @@ WAIT_AFTER_CHUNK_S = 0.02
 WAIT_FOR_DONE_TIMEOUT_S = 30
 
 PRINT_WIDTH = 384
-SOCKET_PATH = os.path.join(os.environ.get("XDG_RUNTIME_DIR", "/tmp"), "iprint.sock")
+SOCKET_PATH = os.path.join(os.environ.get("XDG_RUNTIME_DIR", "/tmp"), "scorchd.sock")
 
 # Lookup table for the custom CRC-8 variant used by this protocol.
 # Values extracted from BluetoothOrder.calcCrc8() in the decompiled APK (Java signed → Python unsigned).

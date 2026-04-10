@@ -1,5 +1,5 @@
 [Unit]
-Description=iPrint BLE thermal printer daemon
+Description=scorchd — BLE thermal printer daemon
 After=bluetooth.target
 
 [Service]
