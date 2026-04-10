@@ -23,8 +23,10 @@ Usage:
 import argparse
 import asyncio
 import contextlib
+import json
 import logging
 import os
+import signal
 import sys
 import uuid as _uuid_mod
 from typing import Optional
@@ -47,6 +49,7 @@ WAIT_AFTER_CHUNK_S = 0.02
 WAIT_FOR_DONE_TIMEOUT_S = 30
 
 PRINT_WIDTH = 384
+SOCKET_PATH = os.path.join(os.environ.get("XDG_RUNTIME_DIR", "/tmp"), "iprint.sock")
 
 # Lookup table for the custom CRC-8 variant used by this protocol.
 # Values extracted from BluetoothOrder.calcCrc8() in the decompiled APK (Java signed → Python unsigned).
@@ -574,49 +577,192 @@ def _notify_factory(event: asyncio.Event):
     return _on_notify
 
 
-async def send_to_printer(data: bytes, device_arg: Optional[str] = None):
+async def _maybe_acquire_mtu(client) -> None:
+    """BlueZ mis-reports MTU as 23; force negotiation to get the real value."""
+    try:
+        from bleak.backends.bluezdbus.client import BleakClientBlueZDBus
+
+        if isinstance(client, BleakClientBlueZDBus):
+            await client._acquire_mtu()
+    except ImportError:
+        pass
+
+
+async def _transmit(client, data: bytes, done_event: asyncio.Event) -> None:
+    chunk_size = client.mtu_size - 3
+    chunks = [data[i : i + chunk_size] for i in range(0, len(data), chunk_size)]
+    log.info(f"⏳ Sending {len(data)} bytes in {len(chunks)} chunks of {chunk_size}...")
+    for chunk in chunks:
+        await client.write_gatt_char(TX_CHARACTERISTIC_UUID, chunk, response=False)
+        await asyncio.sleep(WAIT_AFTER_CHUNK_S)
+    log.info("⏳ Waiting for printer to finish...")
+    try:
+        await asyncio.wait_for(done_event.wait(), timeout=WAIT_FOR_DONE_TIMEOUT_S)
+    except asyncio.TimeoutError:
+        log.warning("⚠️  Timed out waiting for printer-ready signal. Print may still have succeeded.")
+
+
+async def printer_daemon(
+    device_arg: Optional[str] = None,
+    interval: int = 30,
+    socket_path: str = SOCKET_PATH,
+):
     from bleak import BleakClient
 
-    try:
-        from bleak.backends.bluezdbus.client import (
-            BleakClientBlueZDBus as _BleakClientBlueZDBus,
-        )
+    state: dict = {"client": None, "done_event": asyncio.Event()}
+    lock = asyncio.Lock()
 
-        _bluez_type: type = _BleakClientBlueZDBus
-    except ImportError:
-        _bluez_type = type(None)
+    async def _connection_loop():
+        address = await _resolve_address(device_arg)
+        while True:
+            try:
+                client = BleakClient(address)
+                await client.connect()
+                await _maybe_acquire_mtu(client)
+                log.info(f"✅ Connected  |  MTU: {client.mtu_size}")
+                state["client"] = client
+
+                def _on_notify(_sender, data):
+                    log.debug(f"📡 Notification: {data.hex()}")
+                    if bytes(data) == PRINTER_READY_NOTIFICATION:
+                        log.info("✅ Printer ready.")
+                        state["done_event"].set()
+
+                await client.start_notify(RX_CHARACTERISTIC_UUID, _on_notify)
+
+                while client.is_connected:
+                    await asyncio.sleep(1)
+
+                state["client"] = None
+                with contextlib.suppress(Exception):
+                    await client.disconnect()
+                log.warning("⚠️  Disconnected. Reconnecting in 5s...")
+            except asyncio.CancelledError:
+                if state["client"]:
+                    with contextlib.suppress(Exception):
+                        await state["client"].disconnect()
+                return
+            except Exception as e:
+                log.warning(f"⚠️  Connection error ({e}). Reconnecting in 5s...")
+                state["client"] = None
+            await asyncio.sleep(5)
+
+    async def _heartbeat_loop():
+        while True:
+            await asyncio.sleep(interval)
+            client = state["client"]
+            if client and client.is_connected:
+                try:
+                    log.info("💓 Heartbeat...")
+                    await client.write_gatt_char(
+                        TX_CHARACTERISTIC_UUID, cmd_get_dev_state(), response=False
+                    )
+                except Exception as e:
+                    log.warning(f"⚠️  Heartbeat failed: {e}")
+
+    async def _handle_connection(reader, writer):
+        try:
+            header = await reader.readexactly(4)
+            length = int.from_bytes(header, "big")
+            payload = await reader.readexactly(length)
+            req = json.loads(payload)
+
+            cmd = req.get("cmd")
+
+            if cmd == "status":
+                client = state["client"]
+                resp: dict = {"connected": bool(client and client.is_connected)}
+
+            elif cmd == "print":
+                client = state["client"]
+                if not client or not client.is_connected:
+                    resp = {"ok": False, "error": "Printer not connected"}
+                else:
+                    try:
+                        ct = req.get("content_type")
+                        energy = req.get("energy", 0xFFFF)
+                        if ct == "image":
+                            rows = load_image(req["path"], algo=req.get("algo", "floyd-steinberg"))
+                        elif ct == "text":
+                            rows = text_to_image(req["text"], font_size=req.get("font_size", 24))
+                        elif ct == "black":
+                            rows = make_solid_black_rows(req["mm"])
+                        else:
+                            raise ValueError(f"Unknown content_type: {ct!r}")
+                        data = build_print_commands(rows, energy=energy)
+                        async with lock:
+                            done_ev = asyncio.Event()
+                            state["done_event"] = done_ev
+                            await _transmit(client, data, done_ev)
+                        resp = {"ok": True}
+                    except Exception as e:
+                        resp = {"ok": False, "error": str(e)}
+
+            else:
+                resp = {"ok": False, "error": f"Unknown command: {cmd!r}"}
+
+            out = json.dumps(resp).encode()
+            writer.write(len(out).to_bytes(4, "big") + out)
+            await writer.drain()
+
+        except Exception as e:
+            log.warning(f"⚠️  Socket handler error: {e}")
+        finally:
+            writer.close()
+            with contextlib.suppress(Exception):
+                await writer.wait_closed()
+
+    with contextlib.suppress(FileNotFoundError):
+        os.unlink(socket_path)
+
+    log.info(f"⏳ Daemon starting — socket: {socket_path}, heartbeat every {interval}s. Ctrl+C to stop.")
+
+    stop = asyncio.Event()
+    asyncio.get_event_loop().add_signal_handler(signal.SIGTERM, stop.set)
+
+    server = await asyncio.start_unix_server(_handle_connection, path=socket_path)
+    conn_task = asyncio.create_task(_connection_loop())
+    hb_task = asyncio.create_task(_heartbeat_loop())
+
+    async with server:
+        await stop.wait()
+
+    conn_task.cancel()
+    hb_task.cancel()
+    await asyncio.gather(conn_task, hb_task, return_exceptions=True)
+    with contextlib.suppress(FileNotFoundError):
+        os.unlink(socket_path)
+    log.info("✅ Daemon stopped.")
+
+
+async def send_to_printer(data: bytes, device_arg: Optional[str] = None):
+    from bleak import BleakClient
 
     address = await _resolve_address(device_arg)
     log.info(f"⏳ Connecting to {address}...")
 
     async with BleakClient(address) as client:
-        # BlueZ mis-reports MTU as 23; force negotiation to get the real value
-        if _bluez_type is not type(None) and isinstance(client, _bluez_type):
-            await client._acquire_mtu()
-
+        await _maybe_acquire_mtu(client)
         log.info(f"✅ Connected  |  MTU: {client.mtu_size}")
-        chunk_size = client.mtu_size - 3
         done_event = asyncio.Event()
-
         await client.start_notify(RX_CHARACTERISTIC_UUID, _notify_factory(done_event))
-
-        chunks = [data[i : i + chunk_size] for i in range(0, len(data), chunk_size)]
-        log.info(
-            f"⏳ Sending {len(data)} bytes in {len(chunks)} chunks of {chunk_size}..."
-        )
-        for chunk in chunks:
-            await client.write_gatt_char(TX_CHARACTERISTIC_UUID, chunk, response=False)
-            await asyncio.sleep(WAIT_AFTER_CHUNK_S)
-
-        log.info("⏳ Waiting for printer to finish...")
-        try:
-            await asyncio.wait_for(done_event.wait(), timeout=WAIT_FOR_DONE_TIMEOUT_S)
-        except asyncio.TimeoutError:
-            log.warning(
-                "⚠️  Timed out waiting for printer-ready signal. Print may still have succeeded."
-            )
+        await _transmit(client, data, done_event)
 
     log.info("✅ Done.")
+
+
+async def send_to_daemon(req: dict, socket_path: str = SOCKET_PATH) -> dict:
+    reader, writer = await asyncio.open_unix_connection(socket_path)
+    try:
+        payload = json.dumps(req).encode()
+        writer.write(len(payload).to_bytes(4, "big") + payload)
+        await writer.drain()
+        length = int.from_bytes(await reader.readexactly(4), "big")
+        return json.loads(await reader.readexactly(length))
+    finally:
+        writer.close()
+        with contextlib.suppress(Exception):
+            await writer.wait_closed()
 
 
 async def scan_and_list():
@@ -649,7 +795,12 @@ def _build_parser() -> argparse.ArgumentParser:
             '  uv run print.py "Hello!" --text\n'
             "  uv run print.py --black 20\n"
             "  uv run print.py note.png --device GT01 --energy 0x8000\n"
-            "  uv run print.py --scan"
+            "  uv run print.py --scan\n"
+            "  uv run print.py --status\n"
+            "  uv run print.py --daemon\n"
+            "  uv run print.py --daemon 60 --socket /tmp/iprint.sock\n"
+            "\n"
+            "If the daemon is running, print commands are routed through it automatically."
         ),
     )
     p.add_argument(
@@ -700,6 +851,24 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Font size for --text mode (default: 24).",
     )
     p.add_argument(
+        "--daemon",
+        "-k",
+        type=int,
+        nargs="?",
+        const=30,
+        metavar="SECONDS",
+        help="Run as a persistent daemon: hold BLE connection, heartbeat every SECONDS (default: 30), accept print jobs over a Unix socket.",
+    )
+    p.add_argument(
+        "--socket",
+        default=SOCKET_PATH,
+        metavar="PATH",
+        help=f"Unix socket path for --daemon mode (default: {SOCKET_PATH}).",
+    )
+    p.add_argument(
+        "--status", action="store_true", help="Query the running daemon for printer status."
+    )
+    p.add_argument(
         "--scan", action="store_true", help="Scan for nearby iPrint printers and exit."
     )
     p.add_argument(
@@ -723,6 +892,15 @@ def main():
         asyncio.run(scan_and_list())
         return
 
+    if args.daemon is not None:
+        asyncio.run(printer_daemon(device_arg=args.device, interval=args.daemon, socket_path=args.socket))
+        return
+
+    if args.status:
+        resp = asyncio.run(send_to_daemon({"cmd": "status"}, socket_path=args.socket))
+        log.info(f"🖨️  Printer connected: {resp.get('connected')}")
+        return
+
     if args.black is not None and args.black <= 0:
         log.error("🛑 --black must be greater than 0.")
         sys.exit(1)
@@ -739,30 +917,55 @@ def main():
         log.error(f"🛑 Invalid --energy value: {args.energy!r}. Use hex like 0xffff.")
         sys.exit(1)
 
-    if args.black is not None:
-        log.info(f"⏳ Building solid black block: {args.black} mm")
-        rows = make_solid_black_rows(args.black)
-        log.info(f"✅ Built: {len(rows)} rows × {PRINT_WIDTH} px")
-    elif args.text:
-        log.info(f"⏳ Rendering text: {args.content!r}")
-        rows = text_to_image(args.content, font_size=args.font_size)
-        log.info(f"✅ Rendered: {len(rows)} rows × {PRINT_WIDTH} px")
-    else:
-        if not os.path.isfile(args.content):
-            log.error(f"🛑 File not found: {args.content!r}")
-            sys.exit(1)
-        log.info(f"⏳ Loading image: {args.content}")
-        rows = load_image(args.content, algo=args.algo)
-        log.info(f"✅ Loaded: {len(rows)} rows × {PRINT_WIDTH} px")
-
-    data = build_print_commands(rows, energy=energy)
-    log.info(f"✅ BLE payload: {len(data)} bytes")
-
     if args.dry_run:
-        log.info("ℹ️  Dry-run — not sending to printer.")
+        if args.black is not None:
+            rows = make_solid_black_rows(args.black)
+        elif args.text:
+            rows = text_to_image(args.content, font_size=args.font_size)
+        else:
+            rows = load_image(args.content, algo=args.algo)
+        data = build_print_commands(rows, energy=energy)
+        log.info(f"ℹ️  Dry-run — {len(data)} bytes, not sending.")
         return
 
-    asyncio.run(send_to_printer(data, device_arg=args.device))
+    use_daemon = os.path.exists(args.socket)
+
+    if use_daemon:
+        log.info(f"ℹ️  Routing through daemon at {args.socket}")
+        if args.black is not None:
+            req: dict = {"cmd": "print", "content_type": "black", "mm": args.black, "energy": energy}
+        elif args.text:
+            req = {"cmd": "print", "content_type": "text", "text": args.content, "font_size": args.font_size, "energy": energy}
+        else:
+            if not os.path.isfile(args.content):
+                log.error(f"🛑 File not found: {args.content!r}")
+                sys.exit(1)
+            req = {"cmd": "print", "content_type": "image", "path": os.path.abspath(args.content), "algo": args.algo, "energy": energy}
+        resp = asyncio.run(send_to_daemon(req, socket_path=args.socket))
+        if resp.get("ok"):
+            log.info("✅ Done.")
+        else:
+            log.error(f"🛑 Daemon error: {resp.get('error')}")
+            sys.exit(1)
+    else:
+        if args.black is not None:
+            log.info(f"⏳ Building solid black block: {args.black} mm")
+            rows = make_solid_black_rows(args.black)
+            log.info(f"✅ Built: {len(rows)} rows × {PRINT_WIDTH} px")
+        elif args.text:
+            log.info(f"⏳ Rendering text: {args.content!r}")
+            rows = text_to_image(args.content, font_size=args.font_size)
+            log.info(f"✅ Rendered: {len(rows)} rows × {PRINT_WIDTH} px")
+        else:
+            if not os.path.isfile(args.content):
+                log.error(f"🛑 File not found: {args.content!r}")
+                sys.exit(1)
+            log.info(f"⏳ Loading image: {args.content}")
+            rows = load_image(args.content, algo=args.algo)
+            log.info(f"✅ Loaded: {len(rows)} rows × {PRINT_WIDTH} px")
+        data = build_print_commands(rows, energy=energy)
+        log.info(f"✅ BLE payload: {len(data)} bytes")
+        asyncio.run(send_to_printer(data, device_arg=args.device))
 
 
 if __name__ == "__main__":
