@@ -4,8 +4,7 @@ After=bluetooth.target
 
 [Service]
 Type=simple
-WorkingDirectory=%h/Repos/re_thermal_printer
-ExecStart=/home/cael/.local/bin/uv run print.py --daemon 30
+ExecStart=%h/.local/bin/scorchd --daemon 30
 Restart=on-failure
 RestartSec=10
 

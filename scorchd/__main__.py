@@ -14,10 +14,10 @@ Print width : 384 px (48 bytes per row, 200 DPI)
 Known names : GT01, GB01, GB02, GB03
 
 Usage:
-  uv run print.py photo.jpg
-  uv run print.py "Hello!" --text
-  uv run print.py note.png --device GT01 --energy 0x8000
-  uv run print.py --scan
+  scorchd photo.jpg
+  scorchd "Hello!" --text
+  scorchd note.png --device GT01 --energy 0x8000
+  scorchd --scan
 """
 
 import argparse
@@ -786,19 +786,19 @@ async def scan_and_list():
 
 def _build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
-        prog="print.py",
+        prog="scorchd",
         description="Print images or text on your iPrint BLE thermal printer.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "Examples:\n"
-            "  uv run print.py photo.jpg\n"
-            '  uv run print.py "Hello!" --text\n'
-            "  uv run print.py --black 20\n"
-            "  uv run print.py note.png --device GT01 --energy 0x8000\n"
-            "  uv run print.py --scan\n"
-            "  uv run print.py --status\n"
-            "  uv run print.py --daemon\n"
-            "  uv run print.py --daemon 60 --socket /tmp/iprint.sock\n"
+            "  scorchd photo.jpg\n"
+            '  scorchd "Hello!" --text\n'
+            "  scorchd --black 20\n"
+            "  scorchd note.png --device GT01 --energy 0x8000\n"
+            "  scorchd --scan\n"
+            "  scorchd --status\n"
+            "  scorchd --daemon\n"
+            "  scorchd --daemon 60 --socket /tmp/iprint.sock\n"
             "\n"
             "If the daemon is running, print commands are routed through it automatically."
         ),

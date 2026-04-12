@@ -1,7 +1,11 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
 [project]
-name = "re-thermal-printer"
+name = "scorchd"
 version = "0.1.0"
-description = "Add your description here"
+description = "iPrint BLE thermal printer daemon and CLI"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
@@ -9,3 +13,9 @@ dependencies = [
     "numpy>=2.4.4",
     "pillow>=12.2.0",
 ]
+
+[project.scripts]
+scorchd = "scorchd.__main__:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["scorchd"]
