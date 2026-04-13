@@ -27,7 +27,35 @@ Ask the daemon whether it currently has an active BLE connection to the printer.
 
 **Response:**
 ```json
-{"connected": true}
+{"connected": true, "state": "idle"}
+```
+
+`state` is one of `"idle"` or `"printing"`.
+
+---
+
+### `reset` — Recover from a stuck print job
+
+Sends a `lattice_end` + `get_dev_state` sequence to the printer to clear any state left
+behind by an aborted job (e.g. a paper jam where the client disconnected mid-print). Also
+resets the daemon's internal job state to `"idle"`.
+
+The daemon serializes this with the print lock, so it is safe to call while another job is
+finishing.
+
+**Request:**
+```json
+{"cmd": "reset"}
+```
+
+**Response (success):**
+```json
+{"ok": true}
+```
+
+**Response (printer not connected):**
+```json
+{"ok": false, "error": "Printer not connected"}
 ```
 
 ---

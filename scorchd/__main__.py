@@ -47,6 +47,7 @@ PRINTER_READY_NOTIFICATION = bytes(
 SCAN_TIMEOUT_S = 10
 WAIT_AFTER_CHUNK_S = 0.02
 WAIT_FOR_DONE_TIMEOUT_S = 30
+WRITE_CHUNK_TIMEOUT_S = 10  # max seconds to wait for a single BLE chunk write
 
 PRINT_WIDTH = 384
 SOCKET_PATH = os.path.join(os.environ.get("XDG_RUNTIME_DIR", "/tmp"), "scorchd.sock")
@@ -405,6 +406,9 @@ def cmd_print_row(row: list) -> bytes:
 
 def build_print_commands(img_rows: list, energy: int = 0xFFFF) -> bytes:
     data = bytearray()
+    # Prepend a lattice_end + status poll to clear any stuck state from a previous
+    # aborted job before starting a new one. Harmless if the printer is already idle.
+    data += cmd_lattice_end()
     data += cmd_get_dev_state()
     data += cmd_set_quality_200dpi()
     data += cmd_set_energy(energy)
@@ -593,7 +597,10 @@ async def _transmit(client, data: bytes, done_event: asyncio.Event) -> None:
     chunks = [data[i : i + chunk_size] for i in range(0, len(data), chunk_size)]
     log.info(f"⏳ Sending {len(data)} bytes in {len(chunks)} chunks of {chunk_size}...")
     for chunk in chunks:
-        await client.write_gatt_char(TX_CHARACTERISTIC_UUID, chunk, response=False)
+        await asyncio.wait_for(
+            client.write_gatt_char(TX_CHARACTERISTIC_UUID, chunk, response=False),
+            timeout=WRITE_CHUNK_TIMEOUT_S,
+        )
         await asyncio.sleep(WAIT_AFTER_CHUNK_S)
     log.info("⏳ Waiting for printer to finish...")
     try:
@@ -609,7 +616,7 @@ async def printer_daemon(
 ):
     from bleak import BleakClient
 
-    state: dict = {"client": None, "done_event": asyncio.Event()}
+    state: dict = {"client": None, "done_event": asyncio.Event(), "job_state": "idle"}
     lock = asyncio.Lock()
 
     async def _connection_loop():
@@ -660,7 +667,25 @@ async def printer_daemon(
                 except Exception as e:
                     log.warning(f"⚠️  Heartbeat failed: {e}")
 
+    async def _printer_cleanup(client) -> None:
+        """Send lattice_end + get_dev_state to recover from a cancelled/aborted job.
+        Must be called while holding `lock`."""
+        log.info("⏳ Sending printer cleanup sequence...")
+        try:
+            cleanup = cmd_lattice_end() + cmd_get_dev_state()
+            chunk_size = client.mtu_size - 3
+            for i in range(0, len(cleanup), chunk_size):
+                await asyncio.wait_for(
+                    client.write_gatt_char(TX_CHARACTERISTIC_UUID, cleanup[i:i+chunk_size], response=False),
+                    timeout=WRITE_CHUNK_TIMEOUT_S,
+                )
+                await asyncio.sleep(WAIT_AFTER_CHUNK_S)
+            log.info("✅ Printer cleanup sent.")
+        except Exception as e:
+            log.warning(f"⚠️  Printer cleanup failed: {e}")
+
     async def _handle_connection(reader, writer):
+        client_disconnected = False
         try:
             header = await reader.readexactly(4)
             length = int.from_bytes(header, "big")
@@ -671,7 +696,24 @@ async def printer_daemon(
 
             if cmd == "status":
                 client = state["client"]
-                resp: dict = {"connected": bool(client and client.is_connected)}
+                resp: dict = {
+                    "connected": bool(client and client.is_connected),
+                    "state": state["job_state"],
+                }
+
+            elif cmd == "reset":
+                client = state["client"]
+                if not client or not client.is_connected:
+                    resp = {"ok": False, "error": "Printer not connected"}
+                else:
+                    try:
+                        async with lock:
+                            state["job_state"] = "idle"
+                            state["done_event"] = asyncio.Event()
+                            await _printer_cleanup(client)
+                        resp = {"ok": True}
+                    except Exception as e:
+                        resp = {"ok": False, "error": str(e)}
 
             elif cmd == "print":
                 client = state["client"]
@@ -691,11 +733,44 @@ async def printer_daemon(
                             raise ValueError(f"Unknown content_type: {ct!r}")
                         data = build_print_commands(rows, energy=energy)
                         async with lock:
+                            state["job_state"] = "printing"
                             done_ev = asyncio.Event()
                             state["done_event"] = done_ev
-                            await _transmit(client, data, done_ev)
+
+                            transmit_task = asyncio.create_task(_transmit(client, data, done_ev))
+                            # reader.read(1) returns b"" on EOF when the client disconnects
+                            watch_task = asyncio.create_task(reader.read(1))
+
+                            done_set, _ = await asyncio.wait(
+                                [transmit_task, watch_task],
+                                return_when=asyncio.FIRST_COMPLETED,
+                            )
+
+                            if watch_task in done_set:
+                                # Client disconnected (Ctrl+C) — cancel transmit and clean up
+                                client_disconnected = True
+                                transmit_task.cancel()
+                                with contextlib.suppress(asyncio.CancelledError, Exception):
+                                    await transmit_task
+                                log.warning("⚠️  Client disconnected mid-print — aborting job.")
+                            else:
+                                watch_task.cancel()
+                                with contextlib.suppress(asyncio.CancelledError):
+                                    await watch_task
+
+                            state["job_state"] = "idle"
+
+                        if client_disconnected:
+                            # Fire-and-forget cleanup outside the lock so the next job can start
+                            async def _cleanup_after_abort():
+                                async with lock:
+                                    await _printer_cleanup(client)
+                            asyncio.create_task(_cleanup_after_abort())
+                            return
+
                         resp = {"ok": True}
                     except Exception as e:
+                        state["job_state"] = "idle"
                         resp = {"ok": False, "error": str(e)}
 
             else:
