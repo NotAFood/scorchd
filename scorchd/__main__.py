@@ -621,33 +621,38 @@ async def printer_daemon(
 
     async def _connection_loop():
         address = await _resolve_address(device_arg)
-        try:
-            client = BleakClient(address)
-            await client.connect()
-            await _maybe_acquire_mtu(client)
-            log.info(f"✅ Connected  |  MTU: {client.mtu_size}")
-            state["client"] = client
+        while True:
+            try:
+                client = BleakClient(address)
+                await client.connect()
+                await _maybe_acquire_mtu(client)
+                log.info(f"✅ Connected  |  MTU: {client.mtu_size}")
+                state["client"] = client
 
-            def _on_notify(_sender, data):
-                log.debug(f"📡 Notification: {data.hex()}")
-                if bytes(data) == PRINTER_READY_NOTIFICATION:
-                    log.info("✅ Printer ready.")
-                    state["done_event"].set()
+                def _on_notify(_sender, data):
+                    log.debug(f"📡 Notification: {data.hex()}")
+                    if bytes(data) == PRINTER_READY_NOTIFICATION:
+                        log.info("✅ Printer ready.")
+                        state["done_event"].set()
 
-            await client.start_notify(RX_CHARACTERISTIC_UUID, _on_notify)
+                await client.start_notify(RX_CHARACTERISTIC_UUID, _on_notify)
 
-            while client.is_connected:
-                await asyncio.sleep(1)
+                while client.is_connected:
+                    await asyncio.sleep(1)
 
-            state["client"] = None
-            with contextlib.suppress(Exception):
-                await client.disconnect()
-            raise RuntimeError("Printer disconnected.")
-        except asyncio.CancelledError:
-            if state["client"]:
+                state["client"] = None
                 with contextlib.suppress(Exception):
-                    await state["client"].disconnect()
-            raise
+                    await client.disconnect()
+                log.warning("⚠️  Disconnected. Reconnecting in 5s...")
+            except asyncio.CancelledError:
+                if state["client"]:
+                    with contextlib.suppress(Exception):
+                        await state["client"].disconnect()
+                return
+            except Exception as e:
+                log.warning(f"⚠️  Connection error ({e}). Reconnecting in 5s...")
+                state["client"] = None
+            await asyncio.sleep(5)
 
     async def _heartbeat_loop():
         while True:
@@ -794,27 +799,14 @@ async def printer_daemon(
     conn_task = asyncio.create_task(_connection_loop())
     hb_task = asyncio.create_task(_heartbeat_loop())
 
-    fatal_error: Optional[BaseException] = None
     async with server:
-        stop_task = asyncio.create_task(stop.wait())
-        done, _ = await asyncio.wait(
-            [stop_task, conn_task],
-            return_when=asyncio.FIRST_COMPLETED,
-        )
-        stop_task.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await stop_task
-        if conn_task in done and not conn_task.cancelled():
-            fatal_error = conn_task.exception()
+        await stop.wait()
 
     conn_task.cancel()
     hb_task.cancel()
     await asyncio.gather(conn_task, hb_task, return_exceptions=True)
     with contextlib.suppress(FileNotFoundError):
         os.unlink(socket_path)
-    if fatal_error:
-        log.error(f"🛑 {fatal_error}")
-        sys.exit(1)
     log.info("✅ Daemon stopped.")
 
 
