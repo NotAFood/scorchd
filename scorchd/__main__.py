@@ -49,6 +49,7 @@ WAIT_AFTER_CHUNK_S = 0.02
 WAIT_FOR_DONE_TIMEOUT_S = 30
 WRITE_CHUNK_TIMEOUT_S = 10  # max seconds to wait for a single BLE chunk write
 
+REVISION = "4"
 PRINT_WIDTH = 384
 SOCKET_PATH = os.path.join(os.environ.get("XDG_RUNTIME_DIR", "/tmp"), "scorchd.sock")
 
@@ -620,9 +621,11 @@ async def printer_daemon(
     lock = asyncio.Lock()
 
     async def _connection_loop():
-        address = await _resolve_address(device_arg)
+        address = None
         while True:
             try:
+                if address is None:
+                    address = await _resolve_address(device_arg)
                 client = BleakClient(address)
                 await client.connect()
                 await _maybe_acquire_mtu(client)
@@ -644,15 +647,22 @@ async def printer_daemon(
                 with contextlib.suppress(Exception):
                     await client.disconnect()
                 log.warning("⚠️  Disconnected. Reconnecting in 5s...")
+                await asyncio.sleep(5)
             except asyncio.CancelledError:
                 if state["client"]:
                     with contextlib.suppress(Exception):
                         await state["client"].disconnect()
                 return
+            except RuntimeError as e:
+                # Scan found nothing — printer is off or out of range; back off before rescanning
+                log.warning(f"⚠️  {e}. Retrying scan in 60s...")
+                state["client"] = None
+                address = None
+                await asyncio.sleep(60)
             except Exception as e:
                 log.warning(f"⚠️  Connection error ({e}). Reconnecting in 5s...")
                 state["client"] = None
-            await asyncio.sleep(5)
+                await asyncio.sleep(5)
 
     async def _heartbeat_loop():
         while True:
@@ -790,6 +800,7 @@ async def printer_daemon(
     with contextlib.suppress(FileNotFoundError):
         os.unlink(socket_path)
 
+    log.info(f"scorchd rev. {REVISION}")
     log.info(f"⏳ Daemon starting — socket: {socket_path}, heartbeat every {interval}s. Ctrl+C to stop.")
 
     stop = asyncio.Event()
