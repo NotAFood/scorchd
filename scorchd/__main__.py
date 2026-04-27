@@ -656,6 +656,13 @@ async def printer_daemon(
                     with contextlib.suppress(Exception):
                         await state["client"].disconnect()
                 return
+            except asyncio.TimeoutError:
+                # asyncio.wait_for cancelled the bleak scanner but BlueZ keeps the scan
+                # session open briefly — wait for it to expire before retrying.
+                log.warning("⚠️  BLE scan timed out. Retrying in 15s...")
+                state["client"] = None
+                address = None
+                await asyncio.sleep(15)
             except RuntimeError as e:
                 # Scan found nothing — printer is off or out of range; back off before rescanning
                 log.warning(f"⚠️  {e}. Retrying scan in 60s...")
