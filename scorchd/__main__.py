@@ -555,7 +555,10 @@ async def _scan_for_printer(name: Optional[str], timeout: int):
             return device.name == name
         return any(u in adv.service_uuids for u in POSSIBLE_SERVICE_UUIDS)
 
-    device = await BleakScanner.find_device_by_filter(_filter, timeout=timeout)
+    device = await asyncio.wait_for(
+        BleakScanner.find_device_by_filter(_filter, timeout=timeout),
+        timeout=timeout + 5,
+    )
     if device is None:
         raise RuntimeError("Printer not found. Make sure it's powered on and in range.")
     log.info(f"✅ Found: {device}")
